@@ -1,0 +1,48 @@
+// ===== START CUT: data/rooms.js =====
+const ROOMS = [
+  {
+    id: 'premium',
+    name: 'Premium Room',
+    price: 9500,
+    desc: 'The pinnacle of resort luxury. Sweeping ocean views, a private jacuzzi, and premium island amenities for an unforgettable stay.',
+    amenities: ['King Bed', 'Ocean View', 'Jacuzzi', 'Balcony'],
+    capacity: 3,
+    img: 'https://images.unsplash.com/photo-1731336478850-6bce7235e320?w=600&h=380&fit=crop&auto=format',
+  },
+  {
+    id: 'deluxe',
+    name: 'Deluxe Room',
+    price: 6500,
+    desc: 'Garden serenity with island elegance. Wake up to lush tropical greenery and the gentle sounds of nature.',
+    amenities: ['King Bed', 'Garden View', 'Aircon', 'Mini Bar'],
+    capacity: 2,
+    img: 'https://images.unsplash.com/photo-1774280954999-9758f11f3d41?w=600&h=380&fit=crop&auto=format',
+  },
+  {
+    id: 'solo',
+    name: 'Solo Room',
+    price: 3500,
+    desc: 'A perfectly appointed space for solo travellers seeking rest, focus, and island tranquility.',
+    amenities: ['Single Bed', 'WiFi', 'Aircon', 'Work Desk'],
+    capacity: 1,
+    img: 'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=600&h=380&fit=crop&auto=format',
+  },
+  {
+    id: 'family',
+    name: 'Family Room',
+    price: 12500,
+    desc: 'Spacious and welcoming for the whole family. Two king beds, a living area, and garden terrace for all.',
+    amenities: ['2 King Beds', 'Living Area', 'Kitchen', 'Garden View'],
+    capacity: 6,
+    img: 'https://images.unsplash.com/photo-1596394516093-501ba68a0ba6?w=600&h=380&fit=crop&auto=format',
+  },
+  {
+    id: 'couple',
+    name: 'Couple Room',
+    price: 7500,
+    desc: 'Romance and seclusion in paradise. Thoughtfully curated for two with ocean views and intimate amenities.',
+    amenities: ['Queen Bed', 'Ocean View', 'Balcony', 'Romantic Setup'],
+    capacity: 2,
+    img: 'https://images.unsplash.com/photo-1559599101-f09722fb4948?w=600&h=380&fit=crop&auto=format',
+  },
+]

@@ -1,0 +1,19 @@
+@import 'tailwindcss';
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: Georgia, 'Times New Roman', serif;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
