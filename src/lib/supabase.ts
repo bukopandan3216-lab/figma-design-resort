@@ -5,13 +5,44 @@ const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
 
 export const supabase = url && anonKey ? createClient(url, anonKey) : null
 
-const LOCAL_KEY = 'palawan-paraiso-bookings'
-
 export interface StoredBooking {
   id: string
   completed?: boolean
   booking_status?: 'ongoing' | 'completed' | 'cancelled'
   [key: string]: unknown
+}
+
+export interface BookingAvailability {
+  item_key: string
+  unit_label: string
+  group_label: string | null
+  start_date: string
+  end_date: string
+  start_time: string
+  end_time: string
+}
+
+export interface BookingInventorySummary {
+  item_key: string
+  unit_type: string
+  total_units: number
+  available_units: number
+}
+
+const availabilityRequests = new Map<string, Promise<BookingAvailability[]>>()
+const inventorySummaryRequests = new Map<string, Promise<BookingInventorySummary[]>>()
+
+function shareInFlightRequest<T>(requests: Map<string, Promise<T>>, key: string, load: () => Promise<T>): Promise<T> {
+  const existing = requests.get(key)
+  if (existing) return existing
+
+  const request = load()
+  requests.set(key, request)
+  const clear = () => {
+    if (requests.get(key) === request) requests.delete(key)
+  }
+  void request.then(clear, clear)
+  return request
 }
 
 export interface AuthUserProfile {
@@ -35,9 +66,31 @@ function profileFromUser(user: { id: string; email?: string; phone?: string; use
 
 export async function getCurrentProfile() {
   if (!supabase) return null
-  const { data, error } = await supabase.auth.getUser()
-  if (error || !data.user) return null
-  return profileFromUser(data.user)
+  const { data: authData, error: authError } = await supabase.auth.getSession()
+  if (authError) throw authError
+  if (!authData.session?.user) return null
+
+  const fallback = profileFromUser(authData.session.user)
+  const { data: accountData, error: accountError } = await supabase
+    .from('customer_account')
+    .select('full_name, email, phone, username')
+    .eq('username', authData.session.user.id)
+    .maybeSingle()
+
+  if (accountError || !accountData) return fallback
+
+  const fullName = String(accountData.full_name ?? '').trim()
+  const nameParts = fullName ? fullName.split(/\s+/) : []
+  const firstName = nameParts.shift() ?? fallback.firstName
+  const lastName = nameParts.join(' ') || fallback.lastName
+
+  return {
+    firstName,
+    lastName,
+    email: accountData.email ?? fallback.email,
+    phone: accountData.phone ?? fallback.phone,
+    username: accountData.username ?? fallback.username,
+  }
 }
 
 export async function signIn(email: string, password: string) {
@@ -64,6 +117,40 @@ export async function signUp(profile: Omit<AuthUserProfile, 'username'> & { pass
     return data.user && data.session ? profileFromUser(data.user) : null
 }
 
+export async function updateProfile(profile: AuthUserProfile) {
+  if (!supabase) return profile
+
+  const { data: userData, error: userError } = await supabase.auth.getUser()
+  if (userError) throw userError
+
+  const userId = userData?.user?.id
+  if (!userId) return profile
+
+  const { error: authError } = await supabase.auth.updateUser({
+    email: profile.email,
+    data: {
+      firstName: profile.firstName,
+      lastName: profile.lastName,
+      phone: profile.phone,
+    },
+  })
+  if (authError) throw authError
+
+  const fullName = `${profile.firstName} ${profile.lastName}`.trim()
+  const { error: accountError } = await supabase.from('customer_account').upsert({
+    username: userId,
+    full_name: fullName || 'Guest User',
+    email: profile.email,
+    phone: profile.phone,
+  }, { onConflict: 'username' })
+  if (accountError) throw accountError
+
+  return {
+    ...profile,
+    username: userId,
+  }
+}
+
 export async function signOut() {
   if (supabase) {
     const { error } = await supabase.auth.signOut()
@@ -72,14 +159,16 @@ export async function signOut() {
 }
 
 export async function loadBookings(): Promise<StoredBooking[]> {
-  if (!supabase) {
-    const saved = localStorage.getItem(LOCAL_KEY)
-    return saved ? JSON.parse(saved) as StoredBooking[] : []
-  }
+  if (!supabase) return []
+
+  const { data: authData, error: authError } = await supabase.auth.getSession()
+  if (authError) throw authError
+  if (!authData.session?.user) return []
 
   const { data, error } = await supabase
     .from('bookings')
     .select('data, completed, booking_status')
+    .eq('user_id', authData.session.user.id)
     .order('created_at', { ascending: true })
 
   if (error) throw error
@@ -89,56 +178,46 @@ export async function loadBookings(): Promise<StoredBooking[]> {
 }
 
 export async function saveBooking(booking: object) {
-  if (!supabase) {
-    const saved = JSON.parse(localStorage.getItem(LOCAL_KEY) ?? '[]')
-    localStorage.setItem(LOCAL_KEY, JSON.stringify([...saved, { ...booking, booking_status: 'ongoing' }]))
-    return
-  }
+  if (!supabase) throw new Error('Supabase is not configured; secure bookings are unavailable.')
 
-  const record = booking as {
-    id: string
-    userId: string
-    receiptId?: string
-    total?: number
-    fee?: number
-    balance?: number
-  }
-  const { error } = await supabase.from('bookings').upsert({
-    id: record.id,
-    user_id: record.userId,
-    data: booking,
-    booking_status: 'ongoing',
-  })
+  const { data, error } = await supabase.rpc('create_customer_booking', { p_booking: booking })
   if (error) throw error
-
-  const { error: receiptError } = await supabase.from('receipt').upsert({
-    booking_id: record.id,
-    receipt_number: record.receiptId ?? record.id,
-    total_amount: record.total ?? 0,
-    downpayment_amount: record.fee ?? 0,
-    balance_amount: record.balance ?? 0,
-  }, { onConflict: 'booking_id' })
-  if (receiptError) throw receiptError
+  if (!data || typeof data !== 'object') throw new Error('The server did not return the saved booking.')
+  return data as StoredBooking
 }
 
 export async function removeBooking(id: string) {
-  if (!supabase) {
-    const saved = JSON.parse(localStorage.getItem(LOCAL_KEY) ?? '[]')
-    localStorage.setItem(LOCAL_KEY, JSON.stringify(saved.map((booking: { id: string }) => booking.id === id ? { ...booking, booking_status: 'cancelled' } : booking)))
-    return
-  }
-
-  const { error } = await supabase.from('bookings').update({ booking_status: 'cancelled', cancelled_at: new Date().toISOString() }).eq('id', id)
+  if (!supabase) throw new Error('Supabase is not configured; secure booking changes are unavailable.')
+  const { error } = await supabase.rpc('cancel_customer_booking', { p_booking_id: id })
   if (error) throw error
 }
 
 export async function setBookingCompleted(id: string, completed: boolean) {
-  if (!supabase) {
-    const saved = JSON.parse(localStorage.getItem(LOCAL_KEY) ?? '[]')
-    localStorage.setItem(LOCAL_KEY, JSON.stringify(saved.map((booking: { id: string }) => booking.id === id ? { ...booking, completed, booking_status: completed ? 'completed' : 'ongoing' } : booking)))
-    return
-  }
-
-  const { error } = await supabase.from('bookings').update({ completed, booking_status: completed ? 'completed' : 'ongoing', completed_at: completed ? new Date().toISOString() : null }).eq('id', id)
+  if (!completed) throw new Error('Completed bookings cannot be reopened.')
+  if (!supabase) throw new Error('Supabase is not configured; secure booking changes are unavailable.')
+  const { error } = await supabase.rpc('complete_customer_booking', { p_booking_id: id })
   if (error) throw error
+}
+
+export function loadBookingAvailability(itemKey: string, fromDate: string, toDate: string): Promise<BookingAvailability[]> {
+  const key = JSON.stringify([itemKey, fromDate, toDate])
+  return shareInFlightRequest(availabilityRequests, key, async () => {
+    if (!supabase) throw new Error('Live availability requires Supabase configuration.')
+    const { data, error } = await supabase.rpc('get_booking_availability', {
+      p_item_key: itemKey,
+      p_from_date: fromDate,
+      p_to_date: toDate,
+    })
+    if (error) throw error
+    return (data ?? []) as BookingAvailability[]
+  })
+}
+
+export function loadBookingInventorySummary(date: string): Promise<BookingInventorySummary[]> {
+  return shareInFlightRequest(inventorySummaryRequests, date, async () => {
+    if (!supabase) throw new Error('Live availability requires Supabase configuration.')
+    const { data, error } = await supabase.rpc('get_booking_inventory_summary', { p_date: date })
+    if (error) throw error
+    return (data ?? []) as BookingInventorySummary[]
+  })
 }

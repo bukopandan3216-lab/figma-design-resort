@@ -1,10 +1,13 @@
-import { useState, useRef, createContext, useContext, useMemo, useEffect } from 'react'
+import { useState, useRef, createContext, useContext, useMemo, useEffect, useCallback } from 'react'
 import FullCalendar from '@fullcalendar/react'
 import dayGridPlugin from '@fullcalendar/daygrid'
 import interactionPlugin from '@fullcalendar/interaction'
 import type { DateClickArg } from '@fullcalendar/interaction'
+import type { DatesSetArg } from '@fullcalendar/core'
 import JsBarcode from 'jsbarcode'
-import { getCurrentProfile, loadBookings, removeBooking, saveBooking, setBookingCompleted, signIn, signOut as supabaseSignOut, signUp } from './lib/supabase'
+import { ITEM_UNITS } from './data/bookingInventory'
+import { BOOKING_UNIT_COLORS, getAvailabilityErrorMessage, useBookingAvailability } from './hooks/useBookingAvailability'
+import { getCurrentProfile, loadBookingInventorySummary, loadBookings, removeBooking, saveBooking, setBookingCompleted, signIn, signOut as supabaseSignOut, signUp, updateProfile, type BookingInventorySummary } from './lib/supabase'
 
 // ===== START CUT: context/ThemeContext.jsx =====
 const DarkCtx = createContext(false)
@@ -60,6 +63,8 @@ interface BookingRecord {
   id: string
   receiptId: string
   createdAt: string
+  booking_status?: 'ongoing' | 'completed' | 'cancelled'
+  paymentStatus?: 'pending' | 'paid' | 'cancelled'
   category: AccomTab
   g: Guest
   itemId: string
@@ -88,6 +93,7 @@ interface BookingRecord {
 }
 
 const BOOKING_STEPS = ['Guest Details', 'Accommodation', 'Details', 'Payment', 'Confirm']
+const VIEW_STORAGE_KEY = 'palawan-paraiso-view'
 
 // ─── Rooms Data ───────────────────────────────────────────────────────────────
 // ===== START CUT: data/rooms.js =====
@@ -475,7 +481,7 @@ function DateInput({ label, value, onChange, minDate }: { label: string; value: 
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 // ===== START CUT: components/auth/LoginView.jsx =====
-function LoginView({ onBack, onSuccess }: { onBack: () => void; onSuccess: (u: UserProfile) => void }) {
+function LoginView({ onBack, onSuccess }: { onBack: () => void; onSuccess: (u: UserProfile) => void | Promise<void> }) {
   const [mode, setMode] = useState<'login' | 'signup'>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -496,7 +502,7 @@ function LoginView({ onBack, onSuccess }: { onBack: () => void; onSuccess: (u: U
     setAuthError('')
     try {
       const profile = await signIn(username, password)
-      if (profile) onSuccess(profile)
+      if (profile) await onSuccess(profile)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to sign in.'
       setAuthError(message.toLowerCase().includes('email not confirmed') ? 'Please confirm your email address before signing in.' : message)
@@ -512,7 +518,7 @@ function LoginView({ onBack, onSuccess }: { onBack: () => void; onSuccess: (u: U
     setAuthError('')
     try {
       const profile = await signUp({ firstName, lastName, email, phone, password })
-      if (profile) onSuccess(profile)
+      if (profile) await onSuccess(profile)
       else setAuthError('Check your email to confirm your account.')
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'Unable to create account.')
@@ -521,7 +527,7 @@ function LoginView({ onBack, onSuccess }: { onBack: () => void; onSuccess: (u: U
 
   function SocialBtn({ icon, label }: { icon: React.ReactNode; label: string }) {
     return (
-      <button type="button" onClick={() => onSuccess({ firstName: 'Guest', lastName: 'User', email: 'guest@example.com', phone: '', username: 'guest' })} className="flex items-center justify-center gap-2.5 w-full py-2.5 rounded-xl text-sm font-medium text-gray-700 border border-gray-200 hover:bg-gray-50 hover:border-gray-300 hover:shadow-sm transition-all">{icon}{label}</button>
+      <button type="button" onClick={() => setAuthError('Social sign-in is not configured. Please use email and password.')} className="flex items-center justify-center gap-2.5 w-full py-2.5 rounded-xl text-sm font-medium text-gray-700 border border-gray-200 hover:bg-gray-50 hover:border-gray-300 hover:shadow-sm transition-all">{icon}{label}</button>
     )
   }
   function Divider({ text }: { text: string }) {
@@ -742,8 +748,8 @@ function Stepper({ cur, steps }: { cur: number; steps: string[] }) {
 }
 
 // ===== START CUT: components/booking/NavFooter.jsx =====
-function NavFooter({ step, total, onBack, onNext, nextLabel = 'Continue', disableBack = false }: {
-  step: number; total: number; onBack: () => void; onNext: () => void; nextLabel?: string; disableBack?: boolean
+function NavFooter({ step, total, onBack, onNext, nextLabel = 'Continue', disableBack = false, disableNext = false }: {
+  step: number; total: number; onBack: () => void; onNext: () => void; nextLabel?: string; disableBack?: boolean; disableNext?: boolean
 }) {
   const { border, text2, text3 } = useTheme()
   return (
@@ -752,7 +758,7 @@ function NavFooter({ step, total, onBack, onNext, nextLabel = 'Continue', disabl
         <ChevL /> Back
       </button>
       <span className="text-[11px] font-medium" style={{ color: text3 }}>Step {step} of {total}</span>
-      <button onClick={onNext} className="flex items-center gap-1 px-4 py-1.5 text-xs text-white rounded-full font-medium hover:opacity-90 transition-opacity" style={{ background: GREEN }}>
+      <button onClick={onNext} disabled={disableNext} className="flex items-center gap-1 px-4 py-1.5 text-xs text-white rounded-full font-medium hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed" style={{ background: GREEN }}>
         {nextLabel} <ChevR />
       </button>
     </div>
@@ -882,8 +888,6 @@ interface DetailsState {
 }
 
 // ─── Booking Calendar Popup ───────────────────────────────────────────────────
-const UNIT_COLORS = ['#38875C','#2563EB','#D97706','#9333EA','#DB2777','#0891B2','#DC2626','#65A30D','#EA580C','#7C3AED']
-
 function BookingCalendarPopup({ itemId, mode, checkIn, checkOut, onSelect, onClose }: {
   itemId: string
   mode: 'checkin' | 'checkout'
@@ -891,25 +895,20 @@ function BookingCalendarPopup({ itemId, mode, checkIn, checkOut, onSelect, onClo
   onSelect: (date: string) => void
   onClose: () => void
 }) {
-  const cfg = ITEM_UNITS[itemId]
   const { card, surface, border, text, text2, dm } = useTheme()
-
+  const [visibleRange, setVisibleRange] = useState({ from: AVAIL_TODAY, to: nextDay(AVAIL_TODAY) })
+  const handleDatesSet = useCallback((info: DatesSetArg) => {
+    const from = info.startStr.slice(0, 10)
+    const to = info.endStr.slice(0, 10)
+    setVisibleRange(current => current.from === from && current.to === to ? current : { from, to })
+  }, [])
+  const { events: occupiedEvents, loading, error } = useBookingAvailability(itemId, visibleRange.from, visibleRange.to)
   const events = useMemo(() => {
-    const occ = (cfg?.units ?? []).flatMap((unit, idx) =>
-      unit.bookings.map(b => ({
-        start: b.from, end: b.to,
-        title: unit.label,
-        backgroundColor: UNIT_COLORS[idx % UNIT_COLORS.length],
-        borderColor: UNIT_COLORS[idx % UNIT_COLORS.length],
-        textColor: '#fff', display: 'block' as const,
-      }))
-    )
-    const bg = []
-    if (checkIn && checkOut && checkIn < checkOut) {
-      bg.push({ start: checkIn, end: checkOut, display: 'background' as const, color: 'rgba(56,135,92,0.18)' })
-    }
-    return [...occ, ...bg]
-  }, [itemId, checkIn, checkOut])
+    const background = checkIn && checkOut && checkIn < checkOut
+      ? [{ start: checkIn, end: checkOut, display: 'background' as const, color: 'rgba(56,135,92,0.18)' }]
+      : []
+    return [...occupiedEvents, ...background]
+  }, [occupiedEvents, checkIn, checkOut])
 
   function handleDateClick(info: DateClickArg) {
     const ds = info.dateStr
@@ -920,16 +919,14 @@ function BookingCalendarPopup({ itemId, mode, checkIn, checkOut, onSelect, onClo
 
   return (
     <div className="fixed inset-0 z-[55] flex" onClick={onClose}>
-      {/* Left panel — calendar popup */}
-      <div className="hidden md:flex flex-col items-center justify-center" style={{ width: 'calc(100% - 440px)', padding: '24px' }} onClick={e => e.stopPropagation()}>
-        <div className="w-full rounded-2xl shadow-2xl overflow-hidden" style={{ background: card, border: `1px solid ${border}`, maxWidth: 520, maxHeight: '90vh' }}>
-          {/* Header */}
-          <div className="flex items-center justify-between px-4 py-3 shrink-0" style={{ borderBottom: `1px solid ${border}` }}>
+      <div className="flex w-full flex-col items-center justify-center p-4 md:w-[calc(100%-440px)] md:p-6" onClick={e => e.stopPropagation()}>
+        <div className="w-full max-h-[92vh] overflow-hidden rounded-2xl shadow-2xl md:max-h-[90vh]" style={{ background: card, border: `1px solid ${border}`, maxWidth: 520 }}>
+          <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${border}` }}>
             <div>
               <p className="text-sm font-semibold" style={{ color: text }}>
-                {mode === 'checkin' ? '📅 Select Check-in Date' : '📅 Select Check-out Date'}
+                {mode === 'checkin' ? 'Select Check-in Date' : 'Select Check-out Date'}
               </p>
-              <p className="text-[10px] mt-0.5" style={{ color: text2 }}>
+              <p className="mt-0.5 text-[10px]" style={{ color: text2 }}>
                 {mode === 'checkout' && checkIn
                   ? `Check-in set: ${fmtLong(checkIn)} — now pick check-out`
                   : 'Tap a date on the calendar below'}
@@ -937,7 +934,6 @@ function BookingCalendarPopup({ itemId, mode, checkIn, checkOut, onSelect, onClo
             </div>
             <button onClick={onClose} className="rounded-full flex items-center justify-center text-xs" style={{ width: 28, height: 28, background: surface, color: text2 }}>✕</button>
           </div>
-          {/* Calendar */}
           <div className={`fc-resort fc-resort-booking${dm ? ' fc-resort-dark' : ''}`} style={{ overflowY: 'auto' }}>
             <FullCalendar
               plugins={[dayGridPlugin, interactionPlugin]}
@@ -945,6 +941,7 @@ function BookingCalendarPopup({ itemId, mode, checkIn, checkOut, onSelect, onClo
               initialDate={mode === 'checkout' && checkIn ? checkIn : AVAIL_TODAY}
               events={events}
               dateClick={handleDateClick}
+              datesSet={handleDatesSet}
               headerToolbar={{ left: 'prev', center: 'title', right: 'next' }}
               height="auto"
               fixedWeekCount={false}
@@ -959,50 +956,19 @@ function BookingCalendarPopup({ itemId, mode, checkIn, checkOut, onSelect, onClo
               }}
             />
           </div>
-          {/* Legend */}
-          {cfg && cfg.units.length > 0 && (
-            <div className="flex flex-wrap gap-x-3 gap-y-1 px-4 py-2.5 shrink-0" style={{ borderTop: `1px solid ${border}` }}>
-              <span className="text-[9px] font-semibold uppercase tracking-wider w-full mb-0.5" style={{ color: text2 }}>Occupied units</span>
-              {cfg.units.map((unit, idx) => (
+          {ITEM_UNITS[itemId]?.units.length > 0 && (
+            <div className="hidden flex-wrap gap-x-3 gap-y-1 px-4 py-2.5 md:flex" style={{ borderTop: `1px solid ${border}` }}>
+              <span className="mb-0.5 w-full text-[9px] font-semibold uppercase tracking-wider" style={{ color: text2 }}>Occupied units</span>
+              {ITEM_UNITS[itemId].units.map((unit, idx) => (
                 <div key={unit.label} className="flex items-center gap-1">
-                  <div className="rounded-sm w-2 h-2 shrink-0" style={{ background: UNIT_COLORS[idx % UNIT_COLORS.length] }} />
+                  <div className="h-2 w-2 shrink-0 rounded-sm" style={{ background: BOOKING_UNIT_COLORS[idx % BOOKING_UNIT_COLORS.length] }} />
                   <span className="text-[9px]" style={{ color: text2 }}>{unit.label}</span>
                 </div>
               ))}
             </div>
           )}
-        </div>
-      </div>
-
-      {/* Mobile: full-screen popup */}
-      <div className="flex md:hidden flex-col items-center justify-center w-full h-full p-4" onClick={e => e.stopPropagation()}>
-        <div className="w-full rounded-2xl shadow-2xl overflow-hidden" style={{ background: card, border: `1px solid ${border}`, maxHeight: '92vh' }}>
-          <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${border}` }}>
-            <p className="text-sm font-semibold" style={{ color: text }}>
-              {mode === 'checkin' ? 'Select Check-in' : 'Select Check-out'}
-            </p>
-            <button onClick={onClose} className="rounded-full flex items-center justify-center text-xs" style={{ width: 28, height: 28, background: surface, color: text2 }}>✕</button>
-          </div>
-          <div className={`fc-resort fc-resort-booking${dm ? ' fc-resort-dark' : ''}`} style={{ overflowY: 'auto' }}>
-            <FullCalendar
-              plugins={[dayGridPlugin, interactionPlugin]}
-              initialView="dayGridMonth"
-              initialDate={mode === 'checkout' && checkIn ? checkIn : AVAIL_TODAY}
-              events={events}
-              dateClick={handleDateClick}
-              headerToolbar={{ left: 'prev', center: 'title', right: 'next' }}
-              height="auto"
-              fixedWeekCount={false}
-              showNonCurrentDates={false}
-              validRange={{ start: AVAIL_TODAY }}
-              dayCellClassNames={info => {
-                const cls: string[] = []
-                if (info.dateStr === checkIn || info.dateStr === checkOut) cls.push('fc-resort-selected')
-                if (info.dateStr < AVAIL_TODAY || (mode === 'checkout' && checkIn && info.dateStr <= checkIn)) cls.push('fc-resort-past')
-                return cls
-              }}
-            />
-          </div>
+          {loading && <p className="px-4 py-2 text-[10px]" style={{ color: text2 }}>Loading live availability…</p>}
+          {error && <p role="alert" className="px-4 py-2 text-[10px] text-red-600">{error}</p>}
         </div>
       </div>
     </div>
@@ -1030,6 +996,26 @@ function S3Details({ category, itemId, g, details, setDetails, onBack, onNext }:
     : VENUES.find(v => v.id === itemId)
 
   const [calMode, setCalMode] = useState<'checkin' | 'checkout' | null>(null)
+  const availabilityFrom = category === 'room' || category === 'cottage'
+    ? details.checkIn || AVAIL_TODAY
+    : details.resDate || AVAIL_TODAY
+  const availabilityTo = category === 'room' || category === 'cottage'
+    ? details.checkOut && details.checkOut > availabilityFrom ? details.checkOut : nextDay(availabilityFrom)
+    : nextDay(availabilityFrom)
+  const availability = useBookingAvailability(itemId, availabilityFrom, availabilityTo)
+
+  useEffect(() => {
+    if (!details.unitLabel || availability.loading || availability.error) return
+    if (category !== 'room' && category !== 'cottage' && category !== 'venue') return
+    const from = category === 'room' || category === 'cottage' ? availabilityFrom : details.resDate
+    const to = category === 'room' || category === 'cottage' ? availabilityTo : nextDay(details.resDate)
+    const timeAvailable = category === 'venue' && (!details.startTime || !details.endTime)
+      ? true
+      : availability.isUnitAvailable(details.unitLabel, from, to, details.startTime, details.endTime)
+    if (!from || !to || !timeAvailable) {
+      up({ unitLabel: '' })
+    }
+  }, [category, details.unitLabel, details.resDate, details.startTime, details.endTime, availability.loading, availability.error, availability.records])
 
   // Room / Cottage: Stay & Dates
   if (category === 'room' || category === 'cottage') {
@@ -1086,26 +1072,29 @@ function S3Details({ category, itemId, g, details, setDetails, onBack, onNext }:
                 </div>
                 <div className="grid grid-cols-2 gap-1.5">
                   {allUnits.map(unit => {
-                    // A unit is occupied if check-in date falls within any of its bookings
-                    const occupiedBooking = unit.bookings.find(b => details.checkIn >= b.from && details.checkIn < b.to)
-                    const avail = !occupiedBooking
+                    const unitRangeEnd = details.checkOut && details.checkOut > details.checkIn ? details.checkOut : nextDay(details.checkIn)
+                    const availabilityKnown = !availability.loading && !availability.error
+                    const avail = availabilityKnown && availability.isUnitAvailable(unit.label, details.checkIn, unitRangeEnd)
+                    const unavailable = availabilityKnown && !avail
                     const sel = details.unitLabel === unit.label
                     return (
                       <button key={unit.label} disabled={!avail} onClick={() => up({ unitLabel: avail ? unit.label : details.unitLabel })}
                         className="px-3 py-2.5 rounded-lg text-xs font-medium text-left transition-all"
-                        style={{ border: `1.5px solid ${sel ? GREEN : avail ? `${GREEN}55` : '#DC262650'}`, background: sel ? `${GREEN}18` : avail ? `${GREEN}0A` : '#DC262608', color: avail ? text : '#DC2626', cursor: avail ? 'pointer' : 'not-allowed' }}>
+                        style={{ border: `1.5px solid ${sel ? GREEN : avail ? `${GREEN}55` : unavailable ? '#DC262650' : border}`, background: sel ? `${GREEN}18` : avail ? `${GREEN}0A` : 'transparent', color: unavailable ? '#DC2626' : text, cursor: avail ? 'pointer' : 'not-allowed' }}>
                         <div className="font-semibold">{unit.label}</div>
                         {avail
                           ? <div className="text-[9px] mt-0.5 font-normal" style={{ color: GREEN }}>Available</div>
-                          : <div className="text-[9px] mt-0.5 font-normal" style={{ color: '#DC2626' }}>
-                              Occupied {fmtLong(occupiedBooking!.from)} – {fmtLong(occupiedBooking!.to)}
-                            </div>
+                          : <div className="text-[9px] mt-0.5 font-normal" style={{ color: unavailable ? '#DC2626' : text2 }}>
+                            {availability.loading ? 'Checking…' : availability.error ? 'Availability unknown' : 'Unavailable'}
+                          </div>
                         }
                         {unit.group && <div className="text-[8px] mt-0.5 opacity-60">{unit.group}</div>}
                       </button>
                     )
                   })}
                 </div>
+                {availability.loading && <p className="text-[10px]" style={{ color: text2 }}>Checking live availability…</p>}
+                {availability.error && <p role="alert" className="text-[10px] text-red-600">{availability.error}</p>}
                 {!details.unitLabel && <p className="text-[10px] mt-1.5" style={{ color: '#D97706' }}>⚠ Please select an available unit to continue.</p>}
               </div>
             )
@@ -1185,7 +1174,7 @@ function S3Details({ category, itemId, g, details, setDetails, onBack, onNext }:
               <div className="flex rounded-lg overflow-hidden text-sm" style={{ background: surface }}>
                 <span className="flex-1 px-3 py-2" style={{ color: text }}>{details.tables}</span>
                 <div className="flex flex-col border-l border-white/10">
-                  <button type="button" className="px-2.5 py-0.5 text-[11px] leading-snug hover:bg-black/10" style={{ color: text2 }} onClick={() => up({ tables: Math.min(20, details.tables + 1) })}>▲</button>
+                  <button type="button" className="px-2.5 py-0.5 text-[11px] leading-snug hover:bg-black/10" style={{ color: text2 }} onClick={() => up({ tables: Math.min(ITEM_UNITS[itemId]?.units.length ?? 1, details.tables + 1) })}>▲</button>
                   <button type="button" className="px-2.5 py-0.5 text-[11px] leading-snug hover:bg-black/10" style={{ color: text2 }} onClick={() => up({ tables: Math.max(1, details.tables - 1) })}>▼</button>
                 </div>
               </div>
@@ -1194,16 +1183,20 @@ function S3Details({ category, itemId, g, details, setDetails, onBack, onNext }:
           {details.resDate && (() => {
             const cfg = ITEM_UNITS[itemId]
             if (!cfg) return null
-            const nextDs = nextDay(details.resDate)
             const groups = Array.from(new Set(cfg.units.map(u => u.group ?? 'Tables')))
             return (
               <div className="rounded-xl p-3 space-y-1" style={{ background: surface }}>
                 <p className="text-[10px] font-semibold uppercase tracking-wider mb-1" style={{ color: text2 }}>Table Availability</p>
                 {groups.map(grp => {
                   const grpUnits = cfg.units.filter(u => (u.group ?? 'Tables') === grp)
-                  const availCount = grpUnits.filter(u => !u.bookings.some(b => b.from < nextDs && b.to > details.resDate)).length
-                  return <div key={grp} className="flex justify-between text-xs"><span style={{ color: text2 }}>{grp} tables</span><span className="font-medium" style={{ color: availCount === 0 ? '#DC2626' : GREEN }}>{availCount}/{grpUnits.length} available</span></div>
+                  const availabilityKnown = !availability.loading && !availability.error
+                  const availCount = availabilityKnown
+                    ? grpUnits.filter(unit => availability.isUnitAvailable(unit.label, details.resDate, nextDay(details.resDate))).length
+                    : null
+                  return <div key={grp} className="flex justify-between text-xs"><span style={{ color: text2 }}>{grp} tables</span><span className="font-medium" style={{ color: availCount === 0 ? '#DC2626' : availCount === null ? text2 : GREEN }}>{availCount === null ? 'Availability unknown' : `${availCount}/${grpUnits.length} available`}</span></div>
                 })}
+                {availability.loading && <p className="text-[10px]" style={{ color: text2 }}>Checking live availability…</p>}
+                {availability.error && <p role="alert" className="text-[10px] text-red-600">{availability.error}</p>}
                 <p className="text-[9px] mt-1" style={{ color: text2 }}>Tables are assigned at check-in.</p>
               </div>
             )
@@ -1278,26 +1271,31 @@ function S3Details({ category, itemId, g, details, setDetails, onBack, onNext }:
         </div>
         {details.resDate && (() => {
           const allUnits = ITEM_UNITS[itemId]?.units ?? []
-          const toDs = nextDay(details.resDate)
-          const availUnits = getAvailableUnitsForRange(itemId, details.resDate, toDs)
-          const availLabels = new Set(availUnits.map(u => u.label))
           return (
             <div>
               <p className="text-[11px] font-medium mb-2" style={{ color: text2 }}>Select Unit</p>
               <div className="grid grid-cols-2 gap-1.5">
-                {allUnits.map(unit => {
-                  const avail = availLabels.has(unit.label)
-                  const sel = details.unitLabel === unit.label
+              {allUnits.map(unit => {
+                const availabilityKnown = !availability.loading && !availability.error
+                const avail = availabilityKnown
+                  && ((!details.startTime || !details.endTime)
+                    || availability.isUnitAvailable(unit.label, details.resDate, nextDay(details.resDate), details.startTime, details.endTime))
+                const unavailable = availabilityKnown && !avail
+                const sel = details.unitLabel === unit.label
                   return (
                     <button key={unit.label} disabled={!avail} onClick={() => up({ unitLabel: unit.label })}
                       className="px-2 py-2 rounded-lg text-xs font-medium text-left transition-all"
-                      style={{ border: `1.5px solid ${sel ? GREEN : avail ? `${GREEN}50` : '#DC262650'}`, background: sel ? `${GREEN}18` : avail ? `${GREEN}08` : '#DC262610', color: avail ? text : '#DC2626', opacity: avail ? 1 : 0.7, cursor: avail ? 'pointer' : 'not-allowed' }}>
+                      style={{ border: `1.5px solid ${sel ? GREEN : avail ? `${GREEN}50` : unavailable ? '#DC262650' : border}`, background: sel ? `${GREEN}18` : avail ? `${GREEN}08` : 'transparent', color: unavailable ? '#DC2626' : text, opacity: avail ? 1 : 0.7, cursor: avail ? 'pointer' : 'not-allowed' }}>
                       <div>{unit.label}</div>
-                      {!avail && <div className="text-[9px] mt-0.5" style={{ color: '#DC2626' }}>Occupied</div>}
+                      {!avail && <div className="text-[9px] mt-0.5" style={{ color: unavailable ? '#DC2626' : text2 }}>
+                        {availability.loading ? 'Checking…' : availability.error ? 'Availability unknown' : 'Occupied'}
+                      </div>}
                     </button>
                   )
                 })}
               </div>
+              {availability.loading && <p className="text-[10px] mt-1" style={{ color: text2 }}>Checking live availability…</p>}
+              {availability.error && <p role="alert" className="text-[10px] mt-1 text-red-600">{availability.error}</p>}
             </div>
           )
         })()}
@@ -1422,11 +1420,12 @@ function S4Payment({ method, setMethod, phone, setPhone, total, payPlan, setPayP
 }
 
 // ─── Step 5: Confirm ──────────────────────────────────────────────────────────
-function S5Confirm({ category, itemId, g, details, method, total, payPlan, downpayOption, onBack, onNext }: {
+function S5Confirm({ category, itemId, g, details, method, total, payPlan, downpayOption, onBack, onNext, isSubmitting, error }: {
   category: AccomTab; itemId: string; g: Guest
   details: DetailsState; method: PayMethod; total: number
   payPlan: PayPlan; downpayOption: DownpayOption | null
   onBack: () => void; onNext: () => void
+  isSubmitting: boolean; error: string | null
 }) {
   const fee = payPlan === 'full' ? total : Math.round(total * 0.3)
   const bal = total - fee
@@ -1508,7 +1507,8 @@ function S5Confirm({ category, itemId, g, details, method, total, payPlan, downp
           <span className="text-xl font-bold" style={{ color: GREEN }}>{total ? peso(total) : '—'}</span>
         </div>
       </div>
-      <NavFooter step={5} total={5} onBack={onBack} onNext={onNext} nextLabel="Confirm &amp; Pay" />
+      {error && <p role="alert" className="px-5 pb-2 text-[11px] text-red-600">{error}</p>}
+      <NavFooter step={5} total={5} onBack={onBack} onNext={onNext} nextLabel={isSubmitting ? 'Saving…' : 'Confirm &amp; Pay'} disableBack={isSubmitting} disableNext={isSubmitting} />
     </>
   )
 }
@@ -1642,7 +1642,7 @@ function BookingFormCard({ children }: { children: React.ReactNode }) {
 }
 
 // ─── Booking Login Gate ───────────────────────────────────────────────────────
-function BookingLoginGate({ onBack, onSuccess }: { onBack: () => void; onSuccess: (u: UserProfile) => void }) {
+function BookingLoginGate({ onBack, onSuccess }: { onBack: () => void; onSuccess: (u: UserProfile) => void | Promise<void> }) {
   const [mode, setMode] = useState<'login' | 'signup'>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -1662,7 +1662,7 @@ function BookingLoginGate({ onBack, onSuccess }: { onBack: () => void; onSuccess
     setAuthError('')
     try {
       const profile = await signIn(username, password)
-      if (profile) onSuccess(profile)
+      if (profile) await onSuccess(profile)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to sign in.'
       setAuthError(message.toLowerCase().includes('email not confirmed') ? 'Please confirm your email address before signing in.' : message)
@@ -1678,7 +1678,7 @@ function BookingLoginGate({ onBack, onSuccess }: { onBack: () => void; onSuccess
     setAuthError('')
     try {
       const profile = await signUp({ firstName, lastName, email, phone, password })
-      if (profile) onSuccess(profile)
+      if (profile) await onSuccess(profile)
       else setAuthError('Check your email to confirm your account.')
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'Unable to create account.')
@@ -1744,13 +1744,13 @@ function BookingLoginGate({ onBack, onSuccess }: { onBack: () => void; onSuccess
         <div className="flex-1 h-px" style={{ background: border }} />
       </div>
       <div className="space-y-1.5">
-        <button type="button" onClick={() => onSuccess({ firstName: 'Google', lastName: 'User', email: 'google@example.com', phone: '', username: 'google_user' })} className="flex items-center justify-center gap-2 w-full py-2 rounded-xl text-xs font-medium transition-all hover:opacity-80" style={{ border: `1px solid ${border}`, color: text, background: 'transparent' }}>
+        <button type="button" onClick={() => setAuthError('Social sign-in is not configured. Please use email and password.')} className="flex items-center justify-center gap-2 w-full py-2 rounded-xl text-xs font-medium transition-all hover:opacity-80" style={{ border: `1px solid ${border}`, color: text, background: 'transparent' }}>
           <IGoogleIcon /> Continue with Google
         </button>
-        <button type="button" onClick={() => onSuccess({ firstName: 'Facebook', lastName: 'User', email: 'facebook@example.com', phone: '', username: 'facebook_user' })} className="flex items-center justify-center gap-2 w-full py-2 rounded-xl text-xs font-medium transition-all hover:opacity-80" style={{ border: `1px solid ${border}`, color: text, background: 'transparent' }}>
+        <button type="button" onClick={() => setAuthError('Social sign-in is not configured. Please use email and password.')} className="flex items-center justify-center gap-2 w-full py-2 rounded-xl text-xs font-medium transition-all hover:opacity-80" style={{ border: `1px solid ${border}`, color: text, background: 'transparent' }}>
           <IFBIcon /> Continue with Facebook
         </button>
-        <button type="button" onClick={() => onSuccess({ firstName: 'Instagram', lastName: 'User', email: 'instagram@example.com', phone: '', username: 'instagram_user' })} className="flex items-center justify-center gap-2 w-full py-2 rounded-xl text-xs font-medium transition-all hover:opacity-80" style={{ border: `1px solid ${border}`, color: text, background: 'transparent' }}>
+        <button type="button" onClick={() => setAuthError('Social sign-in is not configured. Please use email and password.')} className="flex items-center justify-center gap-2 w-full py-2 rounded-xl text-xs font-medium transition-all hover:opacity-80" style={{ border: `1px solid ${border}`, color: text, background: 'transparent' }}>
           <IIGIcon /> Continue with Instagram
         </button>
       </div>
@@ -1766,10 +1766,10 @@ function BookingView({ initialCategory, initialItemId, onBackToHome, onBookingCo
   initialCategory: AccomTab
   initialItemId: string
   onBackToHome: () => void
-  onBookingComplete: (b: BookingRecord) => void
+  onBookingComplete: (b: BookingRecord) => Promise<BookingRecord>
   onViewReservations: () => void
   user: UserProfile | null
-  onLoginSuccess: (u: UserProfile) => void
+  onLoginSuccess: (u: UserProfile) => void | Promise<void>
 }) {
   const [step, setStep] = useState(1)
   const [loginGate, setLoginGate] = useState(false)
@@ -1789,6 +1789,9 @@ function BookingView({ initialCategory, initialItemId, onBackToHome, onBookingCo
   const [confirmedBooking, setConfirmedBooking] = useState<BookingRecord | null>(null)
   const [payPlan, setPayPlan] = useState<PayPlan>('full')
   const [downpayOption, setDownpayOption] = useState<DownpayOption | null>(null)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [bookingError, setBookingError] = useState<string | null>(null)
+  const bookingRequestId = useRef(genId())
 
   const total = calcTotal(localCategory, itemId, calcNights(details.checkIn, details.checkOut), g.pax, details.resType, details.addOns)
   const feeAmt = payPlan === 'full' ? total : Math.round(total * 0.3)
@@ -1796,10 +1799,15 @@ function BookingView({ initialCategory, initialItemId, onBackToHome, onBookingCo
   const fee = feeAmt
   const bal = balAmt
 
-  function handleConfirm() {
+  async function handleConfirm() {
+    if (!user) {
+      setLoginGate(true)
+      return
+    }
+
     const record: BookingRecord = {
-      id: genId(),
-      receiptId: genReceiptId(),
+      id: bookingRequestId.current,
+      receiptId: '',
       createdAt: new Date().toISOString(),
       category: localCategory,
       g,
@@ -1822,16 +1830,57 @@ function BookingView({ initialCategory, initialItemId, onBackToHome, onBookingCo
       payPlan,
       downpayOption,
       unitLabel: details.unitLabel,
-      userId: user?.username ?? user?.email ?? '',
+      userId: user.username,
     }
-    setConfirmedBooking(record)
-    onBookingComplete(record)
-    setStep(6)
+    setIsSubmitting(true)
+    setBookingError(null)
+    try {
+      const saved = await onBookingComplete(record)
+      setConfirmedBooking(saved)
+      setStep(6)
+    } catch (error) {
+      setBookingError(error instanceof Error ? error.message : 'Unable to save this booking. Please try again.')
+    } finally {
+      setIsSubmitting(false)
+    }
   }
 
   const next = () => {
-    if (step === 3 && !user) { setLoginGate(true); return }
-    if (step === 5) { handleConfirm(); return }
+    setBookingError(null)
+    if (step === 1) {
+      if (!g.firstName.trim() || !g.lastName.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(g.email.trim()) || !g.phone.trim()) {
+        setBookingError('Enter the guest name, a valid email address, and phone number to continue.')
+        return
+      }
+    }
+    if (step === 3) {
+      if (localCategory === 'room' || localCategory === 'cottage') {
+        if (!details.checkIn || !details.checkOut || details.checkIn < AVAIL_TODAY || details.checkOut <= details.checkIn || !details.unitLabel) {
+          setBookingError('Select valid stay dates and an available unit.')
+          return
+        }
+        const selected = localCategory === 'room' ? ROOMS.find(item => item.id === itemId) : COTTAGES.find(item => item.id === itemId)
+        if (!selected || g.pax > selected.capacity) {
+          setBookingError('The selected accommodation cannot fit this number of guests.')
+          return
+        }
+      } else if (localCategory === 'restaurant') {
+        if (!details.resDate || details.resDate < AVAIL_TODAY || details.tables < 1 || details.tables > (ITEM_UNITS[itemId]?.units.length ?? 0)) {
+          setBookingError('Select a valid restaurant date and an available table count.')
+          return
+        }
+      } else if (!details.resDate || details.resDate < AVAIL_TODAY || !details.unitLabel
+        || !details.startTime || !details.endTime || details.endTime <= details.startTime) {
+        setBookingError('Select an available venue, event date, and valid start/end times.')
+        return
+      }
+      if (!user) { setLoginGate(true); return }
+    }
+    if (step === 4 && payPlan === 'downpayment' && !downpayOption) {
+      setBookingError('Select how you will pay the remaining balance.')
+      return
+    }
+    if (step === 5) { void handleConfirm(); return }
     setStep(s => s + 1)
   }
   const back = () => {
@@ -1860,14 +1909,15 @@ function BookingView({ initialCategory, initialItemId, onBackToHome, onBookingCo
         </div>
         <BookingFormCard>
           {!loginGate && step < 6 && <Stepper cur={step} steps={dynamicSteps} />}
+          {bookingError && step !== 5 && !loginGate && <p role="alert" className="px-5 py-2 text-[11px] text-red-600">{bookingError}</p>}
           {loginGate
-            ? <BookingLoginGate onBack={() => setLoginGate(false)} onSuccess={u => { onLoginSuccess(u); setLoginGate(false); setStep(4) }} />
+            ? <BookingLoginGate onBack={() => setLoginGate(false)} onSuccess={async u => { await onLoginSuccess(u); setLoginGate(false); setStep(4) }} />
             : <>
               {step === 1 && <S1GuestDetails g={g} setG={setG} onNext={next} />}
-              {step === 2 && <S2Accommodation localCategory={localCategory} setLocalCategory={setLocalCategory} itemId={itemId} setItemId={setItemId} onBack={back} onNext={next} />}
+              {step === 2 && <S2Accommodation localCategory={localCategory} setLocalCategory={setLocalCategory} itemId={itemId} setItemId={id => { setItemId(id); setDetails(current => ({ ...current, unitLabel: '' })) }} onBack={back} onNext={next} />}
               {step === 3 && <S3Details category={localCategory} itemId={itemId} g={g} details={details} setDetails={setDetails} onBack={back} onNext={next} />}
               {step === 4 && <S4Payment method={method} setMethod={setMethod} phone={phone} setPhone={setPhone} total={total} payPlan={payPlan} setPayPlan={setPayPlan} downpayOption={downpayOption} setDownpayOption={setDownpayOption} onBack={back} onNext={next} />}
-              {step === 5 && <S5Confirm category={localCategory} itemId={itemId} g={g} details={details} method={method} total={total} payPlan={payPlan} downpayOption={downpayOption} onBack={back} onNext={next} />}
+              {step === 5 && <S5Confirm category={localCategory} itemId={itemId} g={g} details={details} method={method} total={total} payPlan={payPlan} downpayOption={downpayOption} onBack={back} onNext={next} isSubmitting={isSubmitting} error={bookingError} />}
               {step === 6 && confirmedBooking && <S6Receipt booking={confirmedBooking} onHome={onBackToHome} onViewReservations={onViewReservations} />}
             </>
           }
@@ -1889,14 +1939,15 @@ function BookingView({ initialCategory, initialItemId, onBackToHome, onBookingCo
         {/* Mobile form card — fills remaining space */}
         <div className="flex-1 mx-3 mb-3 rounded-2xl shadow-2xl overflow-hidden flex flex-col safe-bottom" style={{ background: '#ffffff' }}>
           {!loginGate && step < 6 && <Stepper cur={step} steps={dynamicSteps} />}
+          {bookingError && step !== 5 && !loginGate && <p role="alert" className="px-5 py-2 text-[11px] text-red-600">{bookingError}</p>}
           {loginGate
-            ? <BookingLoginGate onBack={() => setLoginGate(false)} onSuccess={u => { onLoginSuccess(u); setLoginGate(false); setStep(4) }} />
+            ? <BookingLoginGate onBack={() => setLoginGate(false)} onSuccess={async u => { await onLoginSuccess(u); setLoginGate(false); setStep(4) }} />
             : <>
               {step === 1 && <S1GuestDetails g={g} setG={setG} onNext={next} />}
-              {step === 2 && <S2Accommodation localCategory={localCategory} setLocalCategory={setLocalCategory} itemId={itemId} setItemId={setItemId} onBack={back} onNext={next} />}
+              {step === 2 && <S2Accommodation localCategory={localCategory} setLocalCategory={setLocalCategory} itemId={itemId} setItemId={id => { setItemId(id); setDetails(current => ({ ...current, unitLabel: '' })) }} onBack={back} onNext={next} />}
               {step === 3 && <S3Details category={localCategory} itemId={itemId} g={g} details={details} setDetails={setDetails} onBack={back} onNext={next} />}
               {step === 4 && <S4Payment method={method} setMethod={setMethod} phone={phone} setPhone={setPhone} total={total} payPlan={payPlan} setPayPlan={setPayPlan} downpayOption={downpayOption} setDownpayOption={setDownpayOption} onBack={back} onNext={next} />}
-              {step === 5 && <S5Confirm category={localCategory} itemId={itemId} g={g} details={details} method={method} total={total} payPlan={payPlan} downpayOption={downpayOption} onBack={back} onNext={next} />}
+              {step === 5 && <S5Confirm category={localCategory} itemId={itemId} g={g} details={details} method={method} total={total} payPlan={payPlan} downpayOption={downpayOption} onBack={back} onNext={next} isSubmitting={isSubmitting} error={bookingError} />}
               {step === 6 && confirmedBooking && <S6Receipt booking={confirmedBooking} onHome={onBackToHome} onViewReservations={onViewReservations} />}
             </>
           }
@@ -1979,19 +2030,14 @@ function ReservationsView({ bookings, onBack }: { bookings: BookingRecord[]; onB
             {b.specialRequests && <Row l="Requests" v={b.specialRequests} />}
             <div className="pt-1 mt-1" style={{ borderTop: `1px solid ${bb}` }} />
             <Row l="Payment" v={mLabel} />
+            <Row l="Payment Plan" v={(b.payPlan ?? 'downpayment') === 'full' ? 'Pay in Full' : b.downpayOption === 'on-arrival' ? 'Pay on Arrival' : 'Follow-up Payment'} />
             <div className="flex items-center gap-1.5 py-0.5">
               <span className="text-xs" style={{ color: bt3 }}>Status</span>
-              <span className="ml-auto text-[9px] font-semibold px-2 py-0.5 rounded-full" style={
-                (b.payPlan ?? 'downpayment') === 'full'
-                  ? { background: '#DCFCE7', color: '#16A34A' }
-                  : b.downpayOption === 'on-arrival'
-                  ? { background: '#FEF3C7', color: '#D97706' }
-                  : { background: '#DBEAFE', color: '#2563EB' }
-              }>
-                {(b.payPlan ?? 'downpayment') === 'full' ? 'Fully Paid' : b.downpayOption === 'on-arrival' ? 'Pay in Arrival' : 'Follow-up'}
+              <span className="ml-auto text-[9px] font-semibold px-2 py-0.5 rounded-full" style={b.paymentStatus === 'paid' ? { background: '#DCFCE7', color: '#16A34A' } : { background: '#FEF3C7', color: '#D97706' }}>
+                {b.paymentStatus === 'paid' ? 'Paid' : 'Payment pending'}
               </span>
             </div>
-            <Row l="Reservation Fee" v={peso(b.fee)} />
+            <Row l={(b.payPlan ?? 'downpayment') === 'full' ? 'Amount Due' : 'Downpayment Due'} v={peso(b.fee)} />
             <Row l="Balance" v={peso(b.balance)} />
             <div className="flex justify-between pt-1 mt-1" style={{ borderTop: `1px solid ${bb}` }}>
               <span className="text-xs font-bold" style={{ color: bt }}>Total</span>
@@ -2333,178 +2379,33 @@ const ITEM_REVIEWS: Record<string, ReviewEntry[]> = {
 }
 
 // ─── Unit occupancy data ──────────────────────────────────────────────────────
-const AVAIL_TODAY = '2026-09-20' // today
-const BADGE_DATE = '2026-09-21'
-
-interface UnitBooking { from: string; to: string }
-interface UnitRow { label: string; group?: string; bookings: UnitBooking[] }
-interface ItemUnitConfig { unitType: string; units: UnitRow[] }
-
-function isUnitOccupied(bookings: UnitBooking[], ds: string) {
-  return bookings.some(b => ds >= b.from && ds < b.to)
+function palawanToday() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Manila' }).format(new Date())
 }
+const AVAIL_TODAY = palawanToday()
 
-const ITEM_UNITS: Record<string, ItemUnitConfig> = {
-  premium: { unitType: 'room', units: [
-    { label: 'Room 1', bookings: [{ from: '2026-09-19', to: '2026-09-23' }, { from: '2026-10-01', to: '2026-10-04' }] },
-    { label: 'Room 2', bookings: [{ from: '2026-09-20', to: '2026-09-26' }] },
-    { label: 'Room 3', bookings: [{ from: '2026-09-25', to: '2026-09-29' }] },
-    { label: 'Room 4', bookings: [{ from: '2026-10-02', to: '2026-10-06' }] },
-  ]},
-  deluxe: { unitType: 'room', units: [
-    { label: 'Room 1', bookings: [{ from: '2026-09-18', to: '2026-09-22' }] },
-    { label: 'Room 2', bookings: [{ from: '2026-09-19', to: '2026-09-24' }] },
-    { label: 'Room 3', bookings: [{ from: '2026-09-20', to: '2026-09-23' }] },
-    { label: 'Room 4', bookings: [{ from: '2026-09-20', to: '2026-09-27' }] },
-    { label: 'Room 5', bookings: [{ from: '2026-09-27', to: '2026-10-01' }] },
-    { label: 'Room 6', bookings: [] },
-  ]},
-  solo: { unitType: 'room', units: [
-    { label: 'Room 1', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Room 2', bookings: [{ from: '2026-09-22', to: '2026-09-24' }] },
-    { label: 'Room 3', bookings: [] },
-    { label: 'Room 4', bookings: [] },
-    { label: 'Room 5', bookings: [{ from: '2026-09-28', to: '2026-10-01' }] },
-    { label: 'Room 6', bookings: [] },
-    { label: 'Room 7', bookings: [] },
-    { label: 'Room 8', bookings: [] },
-  ]},
-  family: { unitType: 'room', units: [
-    { label: 'Room 1', bookings: [{ from: '2026-09-19', to: '2026-09-23' }] },
-    { label: 'Room 2', bookings: [{ from: '2026-09-20', to: '2026-09-25' }] },
-    { label: 'Room 3', bookings: [] },
-  ]},
-  couple: { unitType: 'room', units: [
-    { label: 'Room 1', bookings: [{ from: '2026-09-18', to: '2026-09-22' }] },
-    { label: 'Room 2', bookings: [{ from: '2026-09-19', to: '2026-09-24' }] },
-    { label: 'Room 3', bookings: [{ from: '2026-09-20', to: '2026-09-26' }] },
-    { label: 'Room 4', bookings: [] },
-  ]},
-  'premium-cottage': { unitType: 'cottage', units: [
-    { label: 'Cottage 1', bookings: [{ from: '2026-09-20', to: '2026-09-24' }] },
-    { label: 'Cottage 2', bookings: [] },
-    { label: 'Cottage 3', bookings: [{ from: '2026-09-25', to: '2026-09-28' }] },
-  ]},
-  'open-deluxe': { unitType: 'cottage', units: [
-    { label: 'Cottage 1', bookings: [{ from: '2026-09-19', to: '2026-09-22' }] },
-    { label: 'Cottage 2', bookings: [{ from: '2026-09-20', to: '2026-09-23' }] },
-    { label: 'Cottage 3', bookings: [] },
-    { label: 'Cottage 4', bookings: [] },
-  ]},
-  'deluxe-cottage': { unitType: 'cottage', units: [
-    { label: 'Cottage 1', bookings: [{ from: '2026-09-21', to: '2026-09-25' }] },
-    { label: 'Cottage 2', bookings: [] },
-    { label: 'Cottage 3', bookings: [] },
-    { label: 'Cottage 4', bookings: [] },
-    { label: 'Cottage 5', bookings: [] },
-  ]},
-  'solo-cottage': { unitType: 'cottage', units: [
-    { label: 'Cottage 1', bookings: [] },
-    { label: 'Cottage 2', bookings: [] },
-    { label: 'Cottage 3', bookings: [{ from: '2026-09-23', to: '2026-09-26' }] },
-    { label: 'Cottage 4', bookings: [] },
-    { label: 'Cottage 5', bookings: [] },
-    { label: 'Cottage 6', bookings: [] },
-  ]},
-  'family-cottage': { unitType: 'cottage', units: [
-    { label: 'Cottage 1', bookings: [{ from: '2026-09-19', to: '2026-09-23' }] },
-    { label: 'Cottage 2', bookings: [{ from: '2026-09-20', to: '2026-09-24' }] },
-    { label: 'Cottage 3', bookings: [] },
-  ]},
-  'couple-cottage': { unitType: 'cottage', units: [
-    { label: 'Cottage 1', bookings: [{ from: '2026-09-20', to: '2026-09-25' }] },
-    { label: 'Cottage 2', bookings: [{ from: '2026-09-19', to: '2026-09-22' }] },
-    { label: 'Cottage 3', bookings: [{ from: '2026-09-20', to: '2026-09-26' }] },
-    { label: 'Cottage 4', bookings: [{ from: '2026-09-20', to: '2026-09-24' }] },
-  ]},
-  breakfast: { unitType: 'table', units: [
-    { label: 'Table S-1', group: 'Solo', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table S-2', group: 'Solo', bookings: [{ from: '2026-09-22', to: '2026-09-23' }] },
-    { label: 'Table S-3', group: 'Solo', bookings: [] },
-    { label: 'Table S-4', group: 'Solo', bookings: [] },
-    { label: 'Table D-1', group: 'Duo', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table D-2', group: 'Duo', bookings: [] },
-    { label: 'Table D-3', group: 'Duo', bookings: [] },
-    { label: 'Table Q-1', group: 'Squad', bookings: [] },
-    { label: 'Table Q-2', group: 'Squad', bookings: [] },
-  ]},
-  lunch: { unitType: 'table', units: [
-    { label: 'Table S-1', group: 'Solo', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table S-2', group: 'Solo', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table S-3', group: 'Solo', bookings: [] },
-    { label: 'Table S-4', group: 'Solo', bookings: [] },
-    { label: 'Table D-1', group: 'Duo', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table D-2', group: 'Duo', bookings: [] },
-    { label: 'Table D-3', group: 'Duo', bookings: [] },
-    { label: 'Table Q-1', group: 'Squad', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table Q-2', group: 'Squad', bookings: [] },
-  ]},
-  dinner: { unitType: 'table', units: [
-    { label: 'Table S-1', group: 'Solo', bookings: [] },
-    { label: 'Table S-2', group: 'Solo', bookings: [] },
-    { label: 'Table S-3', group: 'Solo', bookings: [] },
-    { label: 'Table S-4', group: 'Solo', bookings: [] },
-    { label: 'Table D-1', group: 'Duo', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table D-2', group: 'Duo', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table D-3', group: 'Duo', bookings: [] },
-    { label: 'Table Q-1', group: 'Squad', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Table Q-2', group: 'Squad', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-  ]},
-  'open-space': { unitType: 'venue', units: [
-    { label: 'Open Lawn', bookings: [{ from: '2026-09-22', to: '2026-09-23' }] },
-  ]},
-  'covered-hall': { unitType: 'hall', units: [
-    { label: 'Hall A', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Hall B', bookings: [] },
-  ]},
-  'sports-center': { unitType: 'court', units: [
-    { label: 'Court 1', bookings: [{ from: '2026-09-20', to: '2026-09-21' }] },
-    { label: 'Court 2', bookings: [] },
-    { label: 'Court 3', bookings: [] },
-  ]},
-  'sports-field': { unitType: 'field', units: [
-    { label: 'Field 1', bookings: [] },
-    { label: 'Field 2', bookings: [] },
-    { label: 'Field 3', bookings: [] },
-  ]},
-}
-
-function getAvailInfo(itemId: string): { label: string; status: AvailStatus } {
-  const cfg = ITEM_UNITS[itemId]
-  if (!cfg) return { label: 'Available', status: 'Available' }
-  const avail = cfg.units.filter(u => !isUnitOccupied(u.bookings, BADGE_DATE)).length
-  const total = cfg.units.length
-  if (avail === 0) return { label: 'Full', status: 'Full' }
-  if (avail === total) return { label: 'Available', status: 'Available' }
-  const t = cfg.unitType
-  return { label: `${avail} ${t}${avail !== 1 ? 's' : ''} left`, status: avail / total <= 0.4 ? 'Limited' : 'Available' }
-}
-
-function getAvailableUnitsForRange(itemId: string, from: string, to: string): UnitRow[] {
-  const cfg = ITEM_UNITS[itemId]
-  if (!cfg || !from || !to) return cfg?.units ?? []
-  return cfg.units.filter(u => !u.bookings.some(b => b.from < to && b.to > from))
+function getAvailInfo(itemId: string, summary: Record<string, BookingInventorySummary>): { label: string; status: AvailStatus } {
+  const info = summary[itemId]
+  if (!info) return { label: 'Availability unknown', status: 'Unknown' }
+  if (info.available_units === 0) return { label: 'Full', status: 'Full' }
+  if (info.available_units === info.total_units) return { label: 'Available', status: 'Available' }
+  return {
+    label: `${info.available_units} ${info.unit_type}${info.available_units !== 1 ? 's' : ''} available`,
+    status: info.available_units / info.total_units <= 0.4 ? 'Limited' : 'Available',
+  }
 }
 
 function AvailabilityCalendar({ itemId }: { itemId: string }) {
   const cfg = ITEM_UNITS[itemId]
   if (!cfg) return null
   const { dm, surface, border, text, text2, text3 } = useTheme()
-
-  // Assign a distinct palette per unit so overlapping events are distinguishable
-  const unitColors = ['#38875C', '#2563EB', '#D97706', '#9333EA', '#DB2777', '#0891B2', '#DC2626', '#65A30D', '#EA580C', '#7C3AED']
-
-  const events = useMemo(() => cfg.units.flatMap((unit, idx) =>
-    unit.bookings.map(b => ({
-      title: unit.group ? `${unit.label} · ${unit.group}` : unit.label,
-      start: b.from,
-      end: b.to,
-      backgroundColor: unitColors[idx % unitColors.length],
-      borderColor: unitColors[idx % unitColors.length],
-      textColor: '#fff',
-      extendedProps: { unit: unit.label, group: unit.group },
-    }))
-  ), [itemId])
+  const [visibleRange, setVisibleRange] = useState({ from: AVAIL_TODAY, to: nextDay(AVAIL_TODAY) })
+  const handleDatesSet = useCallback((info: DatesSetArg) => {
+    const from = info.startStr.slice(0, 10)
+    const to = info.endStr.slice(0, 10)
+    setVisibleRange(current => current.from === from && current.to === to ? current : { from, to })
+  }, [])
+  const { events, loading, error } = useBookingAvailability(itemId, visibleRange.from, visibleRange.to)
 
   return (
     <div>
@@ -2516,6 +2417,7 @@ function AvailabilityCalendar({ itemId }: { itemId: string }) {
           initialDate={AVAIL_TODAY}
           events={events}
           headerToolbar={{ left: 'prev', center: 'title', right: 'next' }}
+          datesSet={handleDatesSet}
           height="auto"
           dayMaxEvents={3}
           eventDisplay="block"
@@ -2527,12 +2429,14 @@ function AvailabilityCalendar({ itemId }: { itemId: string }) {
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2.5" style={{ borderTop: `1px solid ${border}` }}>
           {cfg.units.map((unit, idx) => (
             <div key={unit.label} className="flex items-center gap-1.5">
-              <div className="rounded-sm w-2.5 h-2.5 shrink-0" style={{ background: unitColors[idx % unitColors.length] }} />
+              <div className="rounded-sm w-2.5 h-2.5 shrink-0" style={{ background: BOOKING_UNIT_COLORS[idx % BOOKING_UNIT_COLORS.length] }} />
               <span className="text-[9px]" style={{ color: text2 }}>{unit.label}</span>
             </div>
           ))}
         </div>
       </div>
+      {loading && <p className="mt-1 text-[10px]" style={{ color: text2 }}>Loading live availability…</p>}
+      {error && <p role="alert" className="mt-1 text-[10px] text-red-600">{error}</p>}
     </div>
   )
 }
@@ -2712,13 +2616,14 @@ function CardDetailModal({ item, onClose, onReserve }: { item: CardDetailItem; o
 }
 
 // ─── Catalogue ────────────────────────────────────────────────────────────────
-type AvailStatus = 'Available' | 'Limited' | 'Full'
+type AvailStatus = 'Available' | 'Limited' | 'Full' | 'Unknown'
 
 function AvailBadge({ status, label }: { status: AvailStatus; label?: string }) {
   const colors: Record<AvailStatus, { bg: string; text: string }> = {
     Available: { bg: '#DCFCE7', text: '#16A34A' },
     Limited: { bg: '#FEF9C3', text: '#CA8A04' },
     Full: { bg: '#FEE2E2', text: '#DC2626' },
+    Unknown: { bg: '#F3F4F6', text: '#6B7280' },
   }
   const c = colors[status]
   return <span className="text-[9px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap" style={{ background: c.bg, color: c.text }}>{label ?? status}</span>
@@ -2755,7 +2660,11 @@ function CatalogueCard({ img, name, desc, price, priceUnit, capacity, amenities,
 }
 
 
-function CatalogueSection({ onReserve }: { onReserve: (category: AccomTab, id: string) => void }) {
+function CatalogueSection({ onReserve, availabilitySummary, availabilityError }: {
+  onReserve: (category: AccomTab, id: string) => void
+  availabilitySummary: Record<string, BookingInventorySummary>
+  availabilityError: string | null
+}) {
   const { surface, card, text, text2, border } = useTheme()
   const [activeTab, setActiveTab] = useState<CatalogueTab>('rooms')
   const [detailItem, setDetailItem] = useState<CardDetailItem | null>(null)
@@ -2784,6 +2693,7 @@ function CatalogueSection({ onReserve }: { onReserve: (category: AccomTab, id: s
           <h2 className="text-4xl lg:text-5xl font-bold" style={{ fontFamily: "'Playfair Display', serif", color: text }}>What We Offer</h2>
           <p className="text-sm mt-3 max-w-xl mx-auto leading-relaxed" style={{ color: text2 }}>Explore our full range of accommodations, dining, and event spaces. Everything you need for the perfect Palawan experience.</p>
         </div>
+        {availabilityError && <p role="alert" className="mb-6 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-center text-sm text-amber-900">{availabilityError} Live booking checks remain disabled until this issue is resolved.</p>}
         <div className="flex items-center gap-2 mb-8 overflow-x-auto pb-1">
           {tabs.map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id)} className="flex items-center gap-2 px-5 py-2.5 rounded-full text-sm font-medium transition-all whitespace-nowrap shrink-0"
@@ -2795,22 +2705,22 @@ function CatalogueSection({ onReserve }: { onReserve: (category: AccomTab, id: s
         </div>
         {activeTab === 'rooms' && (
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
-            {ROOMS.map(r => { const av = getAvailInfo(r.id); return <CatalogueCard key={r.id} img={r.img} name={r.name} desc={r.desc} price={r.price} priceUnit="night" capacity={r.capacity} amenities={r.amenities} availability={av.status} availLabel={av.label} onReserve={() => onReserve('room', r.id)} onViewDetails={() => openDetail({ id: r.id, name: r.name, img: r.img, desc: r.desc, price: r.price, priceUnit: 'night', capacity: r.capacity, amenities: r.amenities, availability: av.status, category: 'room' })} /> })}
+            {ROOMS.map(r => { const av = getAvailInfo(r.id, availabilitySummary); return <CatalogueCard key={r.id} img={r.img} name={r.name} desc={r.desc} price={r.price} priceUnit="night" capacity={r.capacity} amenities={r.amenities} availability={av.status} availLabel={av.label} onReserve={() => onReserve('room', r.id)} onViewDetails={() => openDetail({ id: r.id, name: r.name, img: r.img, desc: r.desc, price: r.price, priceUnit: 'night', capacity: r.capacity, amenities: r.amenities, availability: av.status, category: 'room' })} /> })}
           </div>
         )}
         {activeTab === 'cottages' && (
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
-            {COTTAGES.map(c => { const av = getAvailInfo(c.id); return <CatalogueCard key={c.id} img={c.img} name={c.name} desc={c.desc} price={c.price} priceUnit="night" capacity={c.capacity} amenities={c.amenities} availability={av.status} availLabel={av.label} onReserve={() => onReserve('cottage', c.id)} onViewDetails={() => openDetail({ id: c.id, name: c.name, img: c.img, desc: c.desc, price: c.price, priceUnit: 'night', capacity: c.capacity, amenities: c.amenities, availability: av.status, category: 'cottage' })} /> })}
+            {COTTAGES.map(c => { const av = getAvailInfo(c.id, availabilitySummary); return <CatalogueCard key={c.id} img={c.img} name={c.name} desc={c.desc} price={c.price} priceUnit="night" capacity={c.capacity} amenities={c.amenities} availability={av.status} availLabel={av.label} onReserve={() => onReserve('cottage', c.id)} onViewDetails={() => openDetail({ id: c.id, name: c.name, img: c.img, desc: c.desc, price: c.price, priceUnit: 'night', capacity: c.capacity, amenities: c.amenities, availability: av.status, category: 'cottage' })} /> })}
           </div>
         )}
         {activeTab === 'restaurant' && (
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6">
-            {RESTAURANT_MEALS.map(m => { const av = getAvailInfo(m.id); return <CatalogueCard key={m.id} img={m.img} name={m.meal} desc={`${m.time} · ${m.desc}`} price={m.price} priceUnit="pax" capacity={m.capacity} amenities={['Breakfast', 'Set Menu', 'À la Carte', 'Buffet']} availability={av.status} availLabel={av.label} onReserve={() => onReserve('restaurant', m.id)} onViewDetails={() => openDetail({ id: m.id, name: m.meal, img: m.img, desc: `${m.time} · ${m.desc}`, price: m.price, priceUnit: 'pax', capacity: m.capacity, amenities: ['Breakfast', 'Set Menu', 'À la Carte', 'Buffet'], availability: av.status, category: 'restaurant' })} /> })}
+            {RESTAURANT_MEALS.map(m => { const av = getAvailInfo(m.id, availabilitySummary); return <CatalogueCard key={m.id} img={m.img} name={m.meal} desc={`${m.time} · ${m.desc}`} price={m.price} priceUnit="pax" capacity={m.capacity} amenities={['Breakfast', 'Set Menu', 'À la Carte', 'Buffet']} availability={av.status} availLabel={av.label} onReserve={() => onReserve('restaurant', m.id)} onViewDetails={() => openDetail({ id: m.id, name: m.meal, img: m.img, desc: `${m.time} · ${m.desc}`, price: m.price, priceUnit: 'pax', capacity: m.capacity, amenities: ['Breakfast', 'Set Menu', 'À la Carte', 'Buffet'], availability: av.status, category: 'restaurant' })} /> })}
           </div>
         )}
         {activeTab === 'venues' && (
           <div className="grid sm:grid-cols-2 gap-6">
-            {VENUES.map(v => { const av = getAvailInfo(v.id); return <CatalogueCard key={v.id} img={v.img} name={v.name} desc={v.desc} price={v.price} priceUnit="event" capacity={v.capacity} amenities={v.amenities} availability={av.status} availLabel={av.label} onReserve={() => onReserve('venue', v.id)} onViewDetails={() => openDetail({ id: v.id, name: v.name, img: v.img, desc: v.desc, price: v.price, priceUnit: 'event', capacity: v.capacity, amenities: v.amenities, availability: av.status, category: 'venue' })} /> })}
+            {VENUES.map(v => { const av = getAvailInfo(v.id, availabilitySummary); return <CatalogueCard key={v.id} img={v.img} name={v.name} desc={v.desc} price={v.price} priceUnit="event" capacity={v.capacity} amenities={v.amenities} availability={av.status} availLabel={av.label} onReserve={() => onReserve('venue', v.id)} onViewDetails={() => openDetail({ id: v.id, name: v.name, img: v.img, desc: v.desc, price: v.price, priceUnit: 'event', capacity: v.capacity, amenities: v.amenities, availability: av.status, category: 'venue' })} /> })}
           </div>
         )}
       </div>
@@ -2990,17 +2900,15 @@ function ReceiptPopup({ booking, onClose }: { booking: BookingRecord; onClose: (
           </>}
           {booking.specialRequests && <Row l="Requests" v={booking.specialRequests} />}
           <Row l="Payment Method" v={mLabel} />
-          <Row l="Payment Status" v={
-            (booking.payPlan ?? 'downpayment') === 'full' ? 'Fully Paid' :
-            booking.downpayOption === 'on-arrival' ? 'Pay in Arrival' : 'Follow-up Payment'
-          } />
+          <Row l="Payment Plan" v={(booking.payPlan ?? 'downpayment') === 'full' ? 'Pay in Full' : booking.downpayOption === 'on-arrival' ? 'Pay on Arrival' : 'Follow-up Payment'} />
+          <Row l="Payment Status" v={booking.paymentStatus === 'paid' ? 'Paid' : 'Payment pending'} />
           {booking.unitLabel && <Row l="Unit" v={booking.unitLabel} />}
           <Row l="Pax" v={`${booking.g.pax}`} />
         </div>
 
         {/* Footer totals */}
         <div className="px-5 pb-5 pt-3 space-y-1.5" style={{ borderTop: `1px solid ${border}`, background: surface }}>
-          <div className="flex justify-between text-xs"><span style={{ color: text2 }}>{(booking.payPlan ?? 'downpayment') === 'full' ? 'Total Paid' : 'Downpayment (30%)'}</span><span style={{ color: text }}>{peso(booking.fee)}</span></div>
+          <div className="flex justify-between text-xs"><span style={{ color: text2 }}>{(booking.payPlan ?? 'downpayment') === 'full' ? 'Amount Due' : 'Downpayment Due'}</span><span style={{ color: text }}>{peso(booking.fee)}</span></div>
           {(booking.payPlan ?? 'downpayment') !== 'full' && <div className="flex justify-between text-xs"><span style={{ color: text2 }}>Balance on Arrival</span><span style={{ color: text }}>{peso(booking.balance)}</span></div>}
           <div className="flex justify-between text-sm font-bold pt-1.5" style={{ borderTop: `1px solid ${border}` }}>
             <span style={{ color: text }}>Total</span>
@@ -3014,14 +2922,15 @@ function ReceiptPopup({ booking, onClose }: { booking: BookingRecord; onClose: (
 }
 
 // ===== START CUT: components/profile/ProfileView.jsx =====
-function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, onBack, onBook, toggleDark }: {
+function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, onBack, onBook, onSaveProfile, toggleDark }: {
   user: UserProfile
   bookings: BookingRecord[]
   completedIds: string[]
-  onMarkComplete: (id: string) => void
-  onCancel: (id: string) => void
+  onMarkComplete: (id: string) => Promise<void>
+  onCancel: (id: string) => Promise<void>
   onBack: () => void
   onBook: () => void
+  onSaveProfile: (profile: UserProfile) => Promise<void> | void
   toggleDark: () => void
 }) {
   const { card, surface, border, text, text2, text3, pageBg } = useTheme()
@@ -3030,6 +2939,7 @@ function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, o
   const [editMode, setEditMode] = useState(false)
   const [editUser, setEditUser] = useState<UserProfile>({ ...user })
   const [receiptBooking, setReceiptBooking] = useState<BookingRecord | null>(null)
+  const [reservationError, setReservationError] = useState<string | null>(null)
 
   const incoming = bookings.filter(b => !completedIds.includes(b.id))
   const completed = bookings.filter(b => completedIds.includes(b.id))
@@ -3041,6 +2951,32 @@ function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, o
   function getDateLabel(b: BookingRecord) {
     if (b.category === 'room' || b.category === 'cottage') return b.checkIn ? `${fmtLong(b.checkIn)} → ${fmtLong(b.checkOut)}` : '—'
     return b.resDate ? fmtLong(b.resDate) : '—'
+  }
+
+  function getBookingInterval(b: BookingRecord) {
+    const zone = '+08:00'
+    if (b.category === 'room' || b.category === 'cottage') {
+      return {
+        start: new Date(`${b.checkIn}T00:00:00${zone}`).getTime(),
+        end: new Date(`${b.checkOut}T00:00:00${zone}`).getTime(),
+      }
+    }
+    if (b.category === 'venue') {
+      return {
+        start: new Date(`${b.resDate}T${b.startTime}:00${zone}`).getTime(),
+        end: new Date(`${b.resDate}T${b.endTime}:00${zone}`).getTime(),
+      }
+    }
+    const mealTimes: Record<string, [string, string]> = {
+      breakfast: ['06:00', '10:00'],
+      lunch: ['11:00', '14:30'],
+      dinner: ['18:00', '22:00'],
+    }
+    const [startTime, endTime] = mealTimes[b.itemId] ?? ['', '']
+    return {
+      start: new Date(`${b.resDate}T${startTime}:00${zone}`).getTime(),
+      end: new Date(`${b.resDate}T${endTime}:00${zone}`).getTime(),
+    }
   }
 
   return (
@@ -3104,7 +3040,7 @@ function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, o
                   </div>
                   <div className="flex flex-col gap-1"><label className="text-[10px] font-medium" style={{ color: text2 }}>Email</label><input className="rounded-lg px-3 py-2 text-sm outline-none w-full" style={icStyle(surface, text)} type="email" value={editUser.email} onChange={e => setEditUser({ ...editUser, email: e.target.value })} /></div>
                   <div className="flex flex-col gap-1"><label className="text-[10px] font-medium" style={{ color: text2 }}>Phone</label><input className="rounded-lg px-3 py-2 text-sm outline-none w-full" style={icStyle(surface, text)} value={editUser.phone} onChange={e => setEditUser({ ...editUser, phone: e.target.value })} /></div>
-                  <button className="px-5 py-2 rounded-full text-xs font-semibold text-white hover:opacity-90 transition-opacity" style={{ background: GREEN }} onClick={() => { Object.assign(user, editUser); setEditMode(false) }}>Save Changes</button>
+                  <button className="px-5 py-2 rounded-full text-xs font-semibold text-white hover:opacity-90 transition-opacity" style={{ background: GREEN }} onClick={async () => { await onSaveProfile(editUser); setEditMode(false) }}>Save Changes</button>
                 </div>
               ) : (
                 <div>
@@ -3145,6 +3081,7 @@ function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, o
               </button>
             </div>
 
+            {reservationError && <p role="alert" className="px-4 py-2 text-xs text-red-600">{reservationError}</p>}
             {shown.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 text-center px-6">
                 <div className="rounded-full flex items-center justify-center mb-3" style={{ width: 52, height: 52, background: surface }}>
@@ -3158,6 +3095,9 @@ function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, o
               <div className="p-4 space-y-3">
                 {shown.map(b => {
                   const itemName = getItemName(b.category, b.itemId)
+                  const interval = getBookingInterval(b)
+                  const canCancel = interval.start > Date.now()
+                  const canMarkComplete = interval.end <= Date.now()
                   return (
                     <div key={b.id} className="rounded-xl cursor-pointer transition-all hover:shadow-md" style={{ background: surface, border: `1px solid ${border}` }} onClick={() => setReceiptBooking(b)}>
                       <div className="px-4 py-3 flex items-start justify-between gap-3">
@@ -3180,10 +3120,10 @@ function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, o
                       </div>
                       {tab === 'incoming' && (
                         <div className="flex gap-2 px-4 pb-3" onClick={e => e.stopPropagation()}>
-                          <button onClick={() => onCancel(b.id)} className="flex-1 py-1.5 rounded-full text-[10px] font-semibold border transition-colors" style={{ borderColor: '#DC2626', color: '#DC2626' }}>
+                          <button disabled={!canCancel} onClick={async () => { setReservationError(null); try { await onCancel(b.id) } catch (error) { setReservationError(error instanceof Error ? error.message : 'Unable to cancel this booking.') } }} className="flex-1 py-1.5 rounded-full text-[10px] font-semibold border transition-colors disabled:opacity-40 disabled:cursor-not-allowed" style={{ borderColor: '#DC2626', color: '#DC2626' }}>
                             Cancel
                           </button>
-                          <button onClick={() => onMarkComplete(b.id)} className="flex-1 py-1.5 rounded-full text-[10px] font-semibold text-white transition-opacity hover:opacity-90 flex items-center justify-center gap-1" style={{ background: GREEN }}>
+                          <button disabled={!canMarkComplete} onClick={async () => { setReservationError(null); try { await onMarkComplete(b.id) } catch (error) { setReservationError(error instanceof Error ? error.message : 'Unable to complete this booking.') } }} className="flex-1 py-1.5 rounded-full text-[10px] font-semibold text-white transition-opacity hover:opacity-90 flex items-center justify-center gap-1 disabled:opacity-40 disabled:cursor-not-allowed" style={{ background: GREEN }}>
                             <Chk cls="w-2.5 h-2.5" /> Complete
                           </button>
                         </div>
@@ -3203,11 +3143,13 @@ function ProfileView({ user, bookings, completedIds, onMarkComplete, onCancel, o
 }
 
 // ─── Website ──────────────────────────────────────────────────────────────────
-function Website({ onReserve, onBook, onSignIn, onReservations, onOpenProfile, onLogout, reservationCount, user, toggleDark }: {
+function Website({ onReserve, onBook, onSignIn, onReservations, onOpenProfile, onLogout, reservationCount, user, toggleDark, availabilitySummary, availabilityError }: {
   onReserve: (category: AccomTab, id: string) => void
   onBook: () => void; onSignIn: () => void
   onReservations: () => void; onOpenProfile: () => void; onLogout: () => void
   reservationCount: number; user: UserProfile | null; toggleDark: () => void
+  availabilitySummary: Record<string, BookingInventorySummary>
+  availabilityError: string | null
 }) {
   const [scrolled, setScrolled] = useState(false)
   return (
@@ -3215,7 +3157,7 @@ function Website({ onReserve, onBook, onSignIn, onReservations, onOpenProfile, o
       <Navbar scrolled={scrolled} onBook={onBook} onSignIn={onSignIn} onOpenProfile={onOpenProfile} onLogout={onLogout} onReservations={onReservations} reservationCount={reservationCount} user={user} toggleDark={toggleDark} />
       <HeroSection onBook={onBook} />
       <AboutSection />
-      <CatalogueSection onReserve={onReserve} />
+      <CatalogueSection onReserve={onReserve} availabilitySummary={availabilitySummary} availabilityError={availabilityError} />
       <ContactSection />
       <Footer onBook={onBook} />
     </div>
@@ -3231,8 +3173,15 @@ export default function App() {
   const [completedIds, setCompletedIds] = useState<string[]>([])
   const [user, setUser] = useState<UserProfile | null>(null)
   const [dark, setDark] = useState(false)
+  const [availabilitySummary, setAvailabilitySummary] = useState<Record<string, BookingInventorySummary>>({})
+  const [availabilitySummaryError, setAvailabilitySummaryError] = useState<string | null>(null)
 
   useEffect(() => {
+    const savedView = localStorage.getItem(VIEW_STORAGE_KEY) as View | null
+    if (savedView === 'website' || savedView === 'booking' || savedView === 'login' || savedView === 'reservations' || savedView === 'profile') {
+      setView(savedView)
+    }
+
     getCurrentProfile()
       .then(profile => {
         if (profile) setUser(profile)
@@ -3245,7 +3194,18 @@ export default function App() {
         setCompletedIds(saved.filter(booking => booking.completed).map(booking => booking.id))
       })
       .catch(error => console.error('Unable to load reservations:', error))
+
+    loadBookingInventorySummary(nextDay(palawanToday()))
+      .then(summary => {
+        setAvailabilitySummary(Object.fromEntries(summary.map(item => [item.item_key, item])))
+        setAvailabilitySummaryError(null)
+      })
+      .catch(error => setAvailabilitySummaryError(getAvailabilityErrorMessage(error)))
   }, [])
+
+  useEffect(() => {
+    localStorage.setItem(VIEW_STORAGE_KEY, view)
+  }, [view])
 
   function toggleDark() {
     setDark(d => {
@@ -3261,14 +3221,27 @@ export default function App() {
     setView('booking')
   }
 
-  function handleBookingComplete(record: BookingRecord) {
-    setBookings(prev => [...prev, record])
-    saveBooking(record).catch(error => console.error('Unable to save reservation:', error))
+  async function handleBookingComplete(record: BookingRecord): Promise<BookingRecord> {
+    const saved = await saveBooking(record) as unknown as BookingRecord
+    setBookings(prev => [...prev, saved])
+    return saved
   }
 
-  function handleLogin(u: UserProfile) {
+  async function handleLogin(u: UserProfile) {
     setUser(u)
+    try {
+      const saved = await loadBookings()
+      setBookings(saved.map(({ completed, ...booking }) => booking as unknown as BookingRecord))
+      setCompletedIds(saved.filter(booking => booking.completed).map(booking => booking.id))
+    } catch (error) {
+      console.error('Unable to load reservations after sign-in:', error)
+    }
     if (view !== 'booking') setView('website')
+  }
+
+  async function handleProfileUpdate(updated: UserProfile) {
+    const saved = await updateProfile(updated)
+    setUser(saved)
   }
 
   async function handleLogout() {
@@ -3277,15 +3250,15 @@ export default function App() {
     setView('website')
   }
 
-  function markComplete(id: string) {
+  async function markComplete(id: string) {
+    await setBookingCompleted(id, true)
     setCompletedIds(prev => [...prev, id])
-    setBookingCompleted(id, true).catch(error => console.error('Unable to update reservation:', error))
   }
 
-  function cancelBooking(id: string) {
+  async function cancelBooking(id: string) {
+    await removeBooking(id)
     setBookings(prev => prev.filter(b => b.id !== id))
     setCompletedIds(prev => prev.filter(cid => cid !== id))
-    removeBooking(id).catch(error => console.error('Unable to remove reservation:', error))
   }
 
   const incomingCount = bookings.filter(b => !completedIds.includes(b.id)).length
@@ -3296,13 +3269,13 @@ export default function App() {
     content = <LoginView onBack={() => setView('website')} onSuccess={handleLogin} />
   } else if (view === 'reservations') {
     if (!user) {
-      content = <LoginView onBack={() => setView('website')} onSuccess={u => { handleLogin(u) }} />
+      content = <LoginView onBack={() => setView('website')} onSuccess={handleLogin} />
     } else {
       content = <ReservationsView bookings={bookings.filter(b => b.userId === (user.username ?? user.email))} onBack={() => setView('profile')} />
     }
   } else if (view === 'profile') {
     if (!user) {
-      content = <LoginView onBack={() => setView('website')} onSuccess={u => { handleLogin(u) }} />
+      content = <LoginView onBack={() => setView('website')} onSuccess={handleLogin} />
     } else {
       content = (
         <ProfileView
@@ -3313,6 +3286,7 @@ export default function App() {
           onCancel={cancelBooking}
           onBack={() => setView('website')}
           onBook={() => openBooking('room', 'premium')}
+          onSaveProfile={handleProfileUpdate}
           toggleDark={toggleDark}
         />
       )
@@ -3341,6 +3315,8 @@ export default function App() {
         reservationCount={incomingCount}
         user={user}
         toggleDark={toggleDark}
+        availabilitySummary={availabilitySummary}
+        availabilityError={availabilitySummaryError}
       />
     )
   }
